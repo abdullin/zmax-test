@@ -1,0 +1,10 @@
+_ReSharper*
+*.user
+*.suo
+Thumbs.db
+.hg
+bin
+packages
+obj
+build
+*.pyc
