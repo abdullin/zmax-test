@@ -16,43 +16,52 @@ namespace zmax_test
 		static void Main(string[] args)
 		{
 			var t = new CancellationTokenSource();
-			var ctx = new Context(2);
+			var ctx = new Context(1);
 
-			int cliendIdx = 0;
-			var client = Task.Factory.StartNew(() =>
+			int[] clientPosition = {0};
+			const int numberOfClients = 5;
+
+			for (int i = 0; i < numberOfClients; i++)
+			{
+				int i1 = i;
+				Task.Factory.StartNew(() =>
 				{
-					Thread.Sleep(200);
-					using (var req = ctx.Socket(SocketType.REP))
-					{
-						req.Bind("tcp://*:8081");
-						while (!t.Token.IsCancellationRequested)
-						{
-							req.Recv();
-							req.Send(Guid.NewGuid().ToByteArray());
-							cliendIdx += 1;
-						}
-					}
-				});
-			int unmarshallerIdx = 0;
-
-			var positions = new long[64000 * 8];
-
-
-			var unmarshaller = Task.Factory.StartNew(() =>
-				{
+					Thread.Sleep(200+ 100*i1);
 					using (var req = ctx.Socket(SocketType.REQ))
-					using (var f = File.Open("queue", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read))
 					{
-						f.SetLength(1024 * 1024 * 50);
 						req.Connect("tcp://192.168.1.1:8081");
 						while (!t.Token.IsCancellationRequested)
 						{
-							req.Send(new byte[] {1}); // ready
+
+							req.Send(Guid.NewGuid().ToByteArray());
+							req.Recv();
+							clientPosition[0] += 1;
+						}
+					}
+				});
+			}
+
+			// normally between the clients and store there will be
+			// majordomo (for load balancing and partitioning but we ignore it for now)
+
+			int storePosition = 0;
+			var positions = new long[64000 * 16];
+			var store = Task.Factory.StartNew(() =>
+				{
+					using (var req = ctx.Socket(SocketType.REP))
+					using (var f = File.Open("queue", FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read))
+					{
+						f.SetLength(1024 * 1024 * 50);
+						req.Bind("tcp://192.168.1.1:8081");
+						while (!t.Token.IsCancellationRequested)
+						{
 							var bytes = req.Recv();
+							req.Send(new byte[0]); // ready
+							
 							f.Write(bytes, 0, bytes.Length);
 
-							positions[unmarshallerIdx] = f.Position;
-							unmarshallerIdx += 1;
+							positions[storePosition] = f.Position;
+							storePosition += 1;
 							f.Flush();
 						}
 					}
@@ -65,15 +74,15 @@ namespace zmax_test
 				{
 					using (var pub = ctx.Socket(SocketType.PUB))
 					{
-						pub.Bind("pgm://192.168.0.110:8082");
-						Thread.Sleep(300);
+						pub.Bind("pgm://192.168.1.1:8082");
+						Thread.Sleep(2000);
 						using (var f = File.Open("queue", FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
 						{
 							var buffer = new byte[16];
 
-							while (!t.Token.IsCancellationRequested)
+							while (true)
 							{
-								while (publisherIdx < unmarshallerIdx)
+								while (publisherIdx < storePosition)
 								{
 									f.Read(buffer, 0, 16);
 									pub.Send(buffer);
@@ -91,9 +100,9 @@ namespace zmax_test
 				{
 					using (var eh = ctx.Socket(SocketType.SUB))
 					{
-						eh.Connect("pgm://192.168.0.110:8082");
+						eh.Connect("pgm://192.168.1.1:8082");
 						eh.Subscribe(new byte[0]);
-						while (!t.Token.IsCancellationRequested)
+						while (true)
 						{
 							eh.Recv();
 							handlerIdx += 1;
@@ -115,26 +124,33 @@ Average guaranteed throughput from 1 client to handlers
 Client         Event Store     Event Handler
 ");
 
-			var watch = Stopwatch.StartNew();
 
-			int handlerStart = handlerIdx;
-			int clientStart = cliendIdx;
-			var storeStart = unmarshallerIdx;
+
 			for (int i = 0; i < int.MaxValue; i++)
 			{
+				var watch = Stopwatch.StartNew();
+				int handlerStart = handlerIdx;
+				int clientStart = clientPosition[0];
+				var storeStart = storePosition;
+
 				Thread.Sleep(1000);
 				var totalSeconds = watch.Elapsed.TotalSeconds;
-				var storeMps = Math.Round((unmarshallerIdx - storeStart) / totalSeconds);
+				var storeMps = Math.Round((storePosition - storeStart) / totalSeconds);
 
 				var handlerMps = Math.Round((handlerIdx - handlerStart) / totalSeconds);
-				var clientMps = Math.Round((cliendIdx - clientStart) / totalSeconds);
+				var clientMps = Math.Round((clientPosition[0] - clientStart) / totalSeconds);
 
-				Console.WriteLine("{0}           {1}            {2} (msg per second)", clientMps, storeMps, handlerMps);
-				if (i > 11)
-					break;
+				Console.WriteLine("{0:00000}          {1:00000}           {2:00000} (msg per second)", clientMps, storeMps, handlerMps);
+				if (i == 11)
+				{
+					Console.WriteLine("Stop sending");
+					t.Cancel();
+				}
+					
 			}
 
 			Console.ReadLine();
+			
 			while (true) {}
 		}
 	}
